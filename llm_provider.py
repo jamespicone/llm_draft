@@ -277,6 +277,152 @@ class OpenAIProvider:
         )
 
 
+class OllamaProvider:
+    """Ollama provider — uses Ollama's OpenAI-compatible API for local LLMs."""
+
+    def __init__(
+        self,
+        model: str = "llama3.1",
+        base_url: str = "http://localhost:11434/v1",
+    ) -> None:
+        import openai
+
+        self.model = model
+        self.client = openai.AsyncOpenAI(base_url=base_url, api_key="ollama")
+
+    async def send_message(
+        self,
+        system: str,
+        messages: list[dict],
+        tools: list[dict],
+        tool_choice: dict | str = "auto",
+        max_tokens: int = 2048,
+    ) -> LLMResponse:
+        # Convert tools from Anthropic format to OpenAI format
+        openai_tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": t["name"],
+                    "description": t.get("description", ""),
+                    "parameters": t.get("input_schema", {}),
+                },
+            }
+            for t in tools
+        ]
+
+        tc_str = "required" if tool_choice == "any" else "auto"
+
+        # Build OpenAI message list (same as OpenAIProvider)
+        openai_messages: list[dict] = [{"role": "system", "content": system}]
+        for msg in messages:
+            role = msg["role"]
+            content = msg["content"]
+
+            if isinstance(content, str):
+                openai_messages.append({"role": role, "content": content})
+            elif isinstance(content, list):
+                tool_use_blocks = [
+                    b for b in content if isinstance(b, (ToolUseBlock,)) or
+                    (isinstance(b, dict) and b.get("type") == "tool_use")
+                ]
+                tool_result_blocks = [
+                    b for b in content if isinstance(b, dict) and b.get("type") == "tool_result"
+                ]
+                text_blocks = [
+                    b for b in content if isinstance(b, (TextBlock,)) or
+                    (isinstance(b, dict) and b.get("type") == "text")
+                ]
+
+                if tool_result_blocks:
+                    for block in tool_result_blocks:
+                        openai_messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": block["tool_use_id"],
+                                "content": block.get("content", ""),
+                            }
+                        )
+                elif tool_use_blocks:
+                    tc_list = []
+                    for block in tool_use_blocks:
+                        if isinstance(block, ToolUseBlock):
+                            bid, bname, binput = block.id, block.name, block.input
+                        else:
+                            bid, bname, binput = block["id"], block["name"], block["input"]
+                        tc_list.append(
+                            {
+                                "id": bid,
+                                "type": "function",
+                                "function": {
+                                    "name": bname,
+                                    "arguments": json.dumps(binput),
+                                },
+                            }
+                        )
+                    text = " ".join(
+                        (b.text if isinstance(b, TextBlock) else b.get("text", ""))
+                        for b in text_blocks
+                    )
+                    openai_messages.append(
+                        {
+                            "role": "assistant",
+                            "content": text or None,
+                            "tool_calls": tc_list,
+                        }
+                    )
+                else:
+                    text = " ".join(
+                        (b.text if isinstance(b, TextBlock) else b.get("text", ""))
+                        for b in text_blocks
+                    )
+                    openai_messages.append({"role": role, "content": text})
+            else:
+                openai_messages.append({"role": role, "content": str(content)})
+
+        response = await self.client.chat.completions.create(
+            model=self.model,
+            messages=openai_messages,  # type: ignore[arg-type]
+            tools=openai_tools if openai_tools else None,  # type: ignore[arg-type]
+            tool_choice=tc_str if openai_tools else None,  # type: ignore[arg-type]
+            max_tokens=max_tokens,
+        )
+
+        message = response.choices[0].message
+        content_blocks: list[TextBlock | ToolUseBlock] = []
+
+        if message.content:
+            content_blocks.append(TextBlock(text=message.content))
+
+        if message.tool_calls:
+            for tc_call in message.tool_calls:
+                try:
+                    input_dict = json.loads(tc_call.function.arguments)
+                except Exception:
+                    input_dict = {}
+                content_blocks.append(
+                    ToolUseBlock(
+                        id=tc_call.id,
+                        name=tc_call.function.name,
+                        input=input_dict,
+                    )
+                )
+
+        # Ollama returns "stop" as finish_reason even when tool calls are present,
+        # so check for actual tool calls in the response instead.
+        stop_reason = "tool_use" if message.tool_calls else "end_turn"
+        usage: dict = {}
+        if response.usage:
+            usage = {
+                "input_tokens": response.usage.prompt_tokens,
+                "output_tokens": response.usage.completion_tokens,
+            }
+
+        return LLMResponse(
+            content=content_blocks, stop_reason=stop_reason, usage=usage
+        )
+
+
 class HumanProvider:
     """Interactive human provider — console input drives the tool-calling loop."""
 

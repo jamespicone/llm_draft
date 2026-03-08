@@ -12,7 +12,7 @@ from card_database import CardDatabase
 from draft_engine import DraftEngine, DraftState, SeatState
 from evaluation import Evaluator
 from llm_harness import LLMHarness
-from llm_provider import AnthropicProvider, HumanProvider, OpenAIProvider
+from llm_provider import AnthropicProvider, HumanProvider, OllamaProvider, OpenAIProvider
 from pack_generator import PackGenerator
 from ratings import Ratings
 
@@ -97,6 +97,9 @@ async def run_draft(args: argparse.Namespace) -> None:
     elif args.provider == "openai":
         model = args.model or "gpt-4o"
         provider = OpenAIProvider(model=model)
+    elif args.provider == "ollama":
+        model = args.model or "llama3.1"
+        provider = OllamaProvider(model=model)
     else:
         model = args.model or "claude-sonnet-4-6"
         provider = AnthropicProvider(model=model)
@@ -133,6 +136,7 @@ async def run_draft(args: argparse.Namespace) -> None:
             tool_calls=harness._last_tool_call_count,
             notes=list(seat_state.notes),
             set_code=set_code,
+            model_text=harness._last_model_text,
         )
         if args.verbose:
             rec = evaluator.pick_records[-1] if evaluator.pick_records else None
@@ -168,6 +172,7 @@ async def run_draft(args: argparse.Namespace) -> None:
         total_output_tokens=harness.total_output_tokens,
         total_api_calls=harness.total_api_calls,
         model=model,
+        deckbuild_actions=harness.deckbuild_actions,
     )
 
     # Summary
@@ -203,7 +208,7 @@ def parse_args() -> argparse.Namespace:
         help="Set code to draft (e.g. DSK, MKM, BLB)"
     )
     draft_parser.add_argument(
-        "--provider", choices=["anthropic", "openai", "human"], default="anthropic",
+        "--provider", choices=["anthropic", "openai", "ollama", "human"], default="anthropic",
         help="LLM provider (default: anthropic)"
     )
     draft_parser.add_argument(

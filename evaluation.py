@@ -46,6 +46,7 @@ class PickRecord:
     best_available: str = ""
     pick_was_best: bool = False
     pick_rank_in_pack: int = 0
+    model_text: str = ""
 
 
 class Evaluator:
@@ -63,6 +64,7 @@ class Evaluator:
         tool_calls: int,
         notes: list[str],
         set_code: str,
+        model_text: str = "",
     ) -> None:
         all_ratings = self.ratings.get_all_ratings(set_code)
 
@@ -98,6 +100,7 @@ class Evaluator:
             best_available=best_available,
             pick_was_best=pick_was_best,
             pick_rank_in_pack=pick_rank,
+            model_text=model_text,
         )
         self.pick_records.append(record)
 
@@ -173,6 +176,7 @@ class Evaluator:
         total_output_tokens: int = 0,
         total_api_calls: int = 0,
         model: str = "",
+        deckbuild_actions: list[dict] | None = None,
     ) -> None:
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
@@ -216,9 +220,11 @@ class Evaluator:
                     "best_available": r.best_available,
                     "was_best": r.pick_was_best,
                     "ratings": r.card_ratings,
+                    "model_text": r.model_text,
                 }
                 for r in self.pick_records
             ],
+            "deckbuild_actions": deckbuild_actions or [],
         }
 
         json_path = output_path / f"{base_name}.json"
@@ -246,6 +252,34 @@ class Evaluator:
             )
             md_lines.append(f"  *Reason*: {r.reasoning}")
             md_lines.append(f"  *Tool calls*: {r.llm_tool_calls}")
+            if r.model_text:
+                # Show truncated model text for debugging
+                text_preview = r.model_text[:300]
+                if len(r.model_text) > 300:
+                    text_preview += "..."
+                md_lines.append(f"  *Model text*: {text_preview}")
+            md_lines.append("")
+
+        if deckbuild_actions:
+            md_lines += [
+                "## Deckbuilding Log",
+                "",
+            ]
+            for action in deckbuild_actions:
+                tool = action["tool"]
+                inp = action.get("input", {})
+                result = action.get("result", "")
+                iteration = action.get("iteration", "?")
+                if tool == "_text_response":
+                    # Truncate long text for readability
+                    text = result[:200] + ("..." if len(result) > 200 else "")
+                    md_lines.append(f"- *(iter {iteration})* Model text: {text}")
+                elif tool in ("view_my_picks", "lookup_card"):
+                    md_lines.append(f"- *(iter {iteration})* **{tool}**({', '.join(f'{k}={v!r}' for k, v in inp.items())})")
+                else:
+                    md_lines.append(
+                        f"- *(iter {iteration})* **{tool}**({', '.join(f'{k}={v!r}' for k, v in inp.items())}) → {result}"
+                    )
             md_lines.append("")
 
         md_lines += [

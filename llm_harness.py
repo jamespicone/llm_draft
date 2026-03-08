@@ -27,7 +27,7 @@ except ImportError:
 
 FUZZY_THRESHOLD = 0.85
 MAX_ITERATIONS = 15
-MAX_DECKBUILD_ITERATIONS = 30
+MAX_DECKBUILD_ITERATIONS = 60
 
 BASIC_LAND_TYPES = ["Plains", "Island", "Swamp", "Mountain", "Forest"]
 
@@ -296,6 +296,10 @@ class LLMHarness:
         # Per-pick data (set after each make_pick call)
         self._last_reasoning: str = ""
         self._last_tool_call_count: int = 0
+        self._last_model_text: str = ""
+
+        # Deckbuilding action log
+        self.deckbuild_actions: list[dict] = []
 
         # Round tracking for context compression
         self._current_set_code: str = ""
@@ -325,6 +329,7 @@ class LLMHarness:
         picked_card: Card | None = None
         reasoning: str = ""
         tool_call_count: int = 0
+        model_text_parts: list[str] = []
 
         for iteration in range(MAX_ITERATIONS):
             tool_choice = "any" if iteration == MAX_ITERATIONS - 1 else "auto"
@@ -343,9 +348,11 @@ class LLMHarness:
 
             # Store assistant response as dicts for message history
             assistant_content: list[dict] = []
+            assistant_text_parts: list[str] = []
             for block in response.content:
                 if isinstance(block, TextBlock):
                     assistant_content.append({"type": "text", "text": block.text})
+                    assistant_text_parts.append(block.text)
                 elif isinstance(block, ToolUseBlock):
                     assistant_content.append(
                         {
@@ -356,6 +363,16 @@ class LLMHarness:
                         }
                     )
             self.messages.append({"role": "assistant", "content": assistant_content})
+
+            # Log model text for debugging
+            assistant_text = "\n".join(assistant_text_parts).strip()
+            if assistant_text:
+                model_text_parts.append(assistant_text)
+                logger.debug(
+                    "Pick P%dP%d iter %d text: %s",
+                    round_num + 1, pick_num + 1, iteration + 1,
+                    assistant_text[:300],
+                )
 
             # Dispatch tool calls
             tool_results: list[dict] = []
@@ -380,6 +397,7 @@ class LLMHarness:
             if picked_card is not None:
                 self._last_reasoning = reasoning
                 self._last_tool_call_count = tool_call_count
+                self._last_model_text = "\n---\n".join(model_text_parts)
                 self._round_picks_data.append((picked_card.name, reasoning))
                 return picked_card
 
@@ -387,7 +405,10 @@ class LLMHarness:
                 self.messages.append(
                     {
                         "role": "user",
-                        "content": "You need to pick a card. Please call the pick_card tool.",
+                        "content": (
+                            "You MUST use tool calls to make your pick. Do NOT describe what you would pick — "
+                            "call the pick_card tool with the card_name and reasoning parameters."
+                        ),
                     }
                 )
 
@@ -398,6 +419,7 @@ class LLMHarness:
         fallback = pack[0]
         self._last_reasoning = "Fallback: auto-picked first card."
         self._last_tool_call_count = tool_call_count
+        self._last_model_text = "\n---\n".join(model_text_parts)
         self._round_picks_data.append((fallback.name, self._last_reasoning))
         return fallback
 
@@ -741,9 +763,11 @@ class LLMHarness:
             self.total_output_tokens += response.usage.get("output_tokens", 0)
 
             assistant_content: list[dict] = []
+            assistant_text_parts: list[str] = []
             for block in response.content:
                 if isinstance(block, TextBlock):
                     assistant_content.append({"type": "text", "text": block.text})
+                    assistant_text_parts.append(block.text)
                 elif isinstance(block, ToolUseBlock):
                     assistant_content.append(
                         {
@@ -755,11 +779,29 @@ class LLMHarness:
                     )
             self.messages.append({"role": "assistant", "content": assistant_content})
 
+            # Log any text the model produced
+            assistant_text = "\n".join(assistant_text_parts).strip()
+            if assistant_text:
+                logger.info("Deckbuild model text [iter %d]: %s", iteration + 1, assistant_text[:500])
+
             tool_results: list[dict] = []
             is_done = False
+            has_tool_calls = False
             for block in response.content:
                 if isinstance(block, ToolUseBlock):
+                    has_tool_calls = True
+                    logger.info(
+                        "Deckbuild tool: %s(%s)", block.name,
+                        ", ".join(f"{k}={v!r}" for k, v in block.input.items()),
+                    )
                     result, done = self._dispatch_deckbuild_tool(block, seat_state)
+                    logger.info("  → %s", result)
+                    self.deckbuild_actions.append({
+                        "iteration": iteration + 1,
+                        "tool": block.name,
+                        "input": block.input,
+                        "result": result,
+                    })
                     tool_results.append(
                         {
                             "type": "tool_result",
@@ -769,6 +811,15 @@ class LLMHarness:
                     )
                     if done:
                         is_done = True
+
+            # Record text-only responses in the deckbuild log too
+            if assistant_text and not has_tool_calls:
+                self.deckbuild_actions.append({
+                    "iteration": iteration + 1,
+                    "tool": "_text_response",
+                    "input": {},
+                    "result": assistant_text[:500],
+                })
 
             if tool_results:
                 self.messages.append({"role": "user", "content": tool_results})
@@ -785,13 +836,18 @@ class LLMHarness:
                         "role": "user",
                         "content": (
                             f"Your deck currently has {deck_size} cards ({lands_now} lands). "
-                            f"Call finalize_deck when you are satisfied with your 40-card deck."
+                            f"You MUST use tool calls to build your deck. Do NOT describe what you would do — actually call the tools. "
+                            f"Available tools: move_card, add_basic_land, remove_basic_land, view_my_picks, finalize_deck."
                         ),
                     }
                 )
 
+        deck_size = len(seat_state.picks)
+        lands = sum(1 for c in seat_state.picks if "Land" in c.type_line)
         logger.warning(
-            f"Deckbuilding did not finalize after {MAX_DECKBUILD_ITERATIONS} iterations."
+            f"Deckbuilding did not finalize after {MAX_DECKBUILD_ITERATIONS} iterations. "
+            f"Deck: {deck_size} cards ({lands} lands, {deck_size - lands} spells), "
+            f"Sideboard: {len(seat_state.sideboard)} cards."
         )
 
     def _dispatch_deckbuild_tool(
